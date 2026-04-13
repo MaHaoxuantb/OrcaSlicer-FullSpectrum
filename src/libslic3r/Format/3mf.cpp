@@ -15,6 +15,8 @@
 
 #include <limits>
 #include <stdexcept>
+#include <array>
+#include <cmath>
 
 #include <boost/algorithm/string/classification.hpp>
 #include <boost/algorithm/string/split.hpp>
@@ -80,6 +82,8 @@ const std::string CUSTOM_GCODE_PER_PRINT_Z_FILE = "Metadata/Prusa_Slicer_custom_
 
 static constexpr const char* MODEL_TAG = "model";
 static constexpr const char* RESOURCES_TAG = "resources";
+static constexpr const char* COLOR_GROUP_TAG = "m:colorgroup";
+static constexpr const char* COLOR_TAG = "m:color";
 static constexpr const char* OBJECT_TAG = "object";
 static constexpr const char* MESH_TAG = "mesh";
 static constexpr const char* VERTICES_TAG = "vertices";
@@ -99,12 +103,17 @@ static constexpr const char* UNIT_ATTR = "unit";
 static constexpr const char* NAME_ATTR = "name";
 static constexpr const char* TYPE_ATTR = "type";
 static constexpr const char* ID_ATTR = "id";
+static constexpr const char* COLOR_ATTR = "color";
 static constexpr const char* X_ATTR = "x";
 static constexpr const char* Y_ATTR = "y";
 static constexpr const char* Z_ATTR = "z";
 static constexpr const char* V1_ATTR = "v1";
 static constexpr const char* V2_ATTR = "v2";
 static constexpr const char* V3_ATTR = "v3";
+static constexpr const char* P1_ATTR = "p1";
+static constexpr const char* P2_ATTR = "p2";
+static constexpr const char* P3_ATTR = "p3";
+static constexpr const char* PID_ATTR = "pid";
 static constexpr const char* OBJECTID_ATTR = "objectid";
 static constexpr const char* TRANSFORM_ATTR = "transform";
 static constexpr const char* PRINTABLE_ATTR = "printable";
@@ -202,6 +211,122 @@ bool get_attribute_value_bool(const char** attributes, unsigned int attributes_s
 {
     const char* text = get_attribute_value_charptr(attributes, attributes_size, attribute_key);
     return (text != nullptr) ? (bool)::atoi(text) : true;
+}
+
+std::string encode_extruder_id_for_mmu_segmentation(int extruder_id)
+{
+    static const std::array<const char*, 17> states = {
+        "", "4", "8", "0C", "1C", "2C", "3C", "4C", "5C", "6C", "7C", "8C", "9C", "AC", "BC", "CC", "DC"
+    };
+
+    if (extruder_id <= 0 || extruder_id >= int(states.size()))
+        return {};
+
+    return states[extruder_id];
+}
+
+bool resolve_uniform_triangle_color_ref(int pid, int p1, int p2, int p3, std::pair<int, int>& color_ref)
+{
+    if (pid < 0)
+        return false;
+
+    const int cp1 = (p1 < 0) ? 0 : p1;
+    const int cp2 = (p2 < 0) ? cp1 : p2;
+    const int cp3 = (p3 < 0) ? cp1 : p3;
+    if (cp1 != cp2 || cp1 != cp3)
+        return false;
+
+    color_ref = std::make_pair(pid, cp1);
+    return true;
+}
+
+bool resolve_triangle_corner_extruders(
+    int pid,
+    int p1,
+    int p2,
+    int p3,
+    const std::map<std::pair<int, int>, int>& color_entry_to_extruder,
+    std::array<int, 3>& out_extruders)
+{
+    if (pid < 0)
+        return false;
+
+    const int cp1 = (p1 < 0) ? 0 : p1;
+    const int cp2 = (p2 < 0) ? cp1 : p2;
+    const int cp3 = (p3 < 0) ? cp1 : p3;
+
+    const auto it1 = color_entry_to_extruder.find({ pid, cp1 });
+    const auto it2 = color_entry_to_extruder.find({ pid, cp2 });
+    const auto it3 = color_entry_to_extruder.find({ pid, cp3 });
+    if (it1 == color_entry_to_extruder.end() || it2 == color_entry_to_extruder.end() || it3 == color_entry_to_extruder.end())
+        return false;
+
+    out_extruders = { it1->second, it2->second, it3->second };
+    return true;
+}
+
+bool encode_triangle_corner_segmentation(
+    const Vec3f& v0,
+    const Vec3f& v1,
+    const Vec3f& v2,
+    const std::array<int, 3>& extruders,
+    std::string& out)
+{
+    out.clear();
+
+    const int e0 = extruders[0];
+    const int e1 = extruders[1];
+    const int e2 = extruders[2];
+    const std::string s0 = encode_extruder_id_for_mmu_segmentation(e0);
+    const std::string s1 = encode_extruder_id_for_mmu_segmentation(e1);
+    const std::string s2 = encode_extruder_id_for_mmu_segmentation(e2);
+    if (s0.empty() || s1.empty() || s2.empty())
+        return false;
+
+    if (e0 == e1 && e1 == e2) {
+        out = s0;
+        return true;
+    }
+
+    if (e0 == e1) {
+        out = s2 + s0 + s0 + "A";
+        return true;
+    }
+    if (e1 == e2) {
+        out = s0 + s1 + s1 + "2";
+        return true;
+    }
+    if (e0 == e2) {
+        out = s1 + s0 + s0 + "6";
+        return true;
+    }
+
+    auto angle_at = [](const Vec3f& a, const Vec3f& b) {
+        const float denom = a.norm() * b.norm();
+        if (denom <= 1e-8f)
+            return 0.0f;
+        const float cosine = std::max(-1.0f, std::min(1.0f, a.dot(b) / denom));
+        return std::acos(cosine);
+    };
+
+    const float angle0 = angle_at(v1 - v0, v2 - v0);
+    const float angle1 = angle_at(v0 - v1, v2 - v1);
+    const float angle2 = angle_at(v0 - v2, v1 - v2);
+
+    int max_angle_vertex = 0;
+    if (angle1 > angle0 && angle1 >= angle2)
+        max_angle_vertex = 1;
+    else if (angle2 > angle0 && angle2 > angle1)
+        max_angle_vertex = 2;
+
+    if (max_angle_vertex == 0)
+        out = s0 + s1 + s2 + (s1 + s2 + "5") + "3";
+    else if (max_angle_vertex == 1)
+        out = s0 + s1 + s2 + (s0 + s2 + "9") + "3";
+    else
+        out = s0 + s1 + s2 + (s1 + s0 + "1") + "3";
+
+    return true;
 }
 
 Slic3r::Transform3d get_transform_from_3mf_specs_string(const std::string& mat_str)
@@ -419,6 +544,10 @@ ModelVolumeType type_from_string(const std::string &s)
             std::vector<std::string> custom_seam;
             std::vector<std::string> mmu_segmentation;
             std::vector<std::string> fuzzy_skin;
+            std::vector<int> triangle_pid;
+            std::vector<int> triangle_p1;
+            std::vector<int> triangle_p2;
+            std::vector<int> triangle_p3;
 
             bool empty() { return vertices.empty() || triangles.empty(); }
 
@@ -429,6 +558,10 @@ ModelVolumeType type_from_string(const std::string &s)
                 custom_seam.clear();
                 mmu_segmentation.clear();
                 fuzzy_skin.clear();
+                triangle_pid.clear();
+                triangle_p1.clear();
+                triangle_p2.clear();
+                triangle_p3.clear();
             }
         };
 
@@ -441,6 +574,7 @@ ModelVolumeType type_from_string(const std::string &s)
             Geometry geometry;
             ModelObject* object;
             ComponentsList components;
+            int pid;
 
             CurrentObject() { reset(); }
 
@@ -450,6 +584,7 @@ ModelVolumeType type_from_string(const std::string &s)
                 geometry.reset();
                 object = nullptr;
                 components.clear();
+                pid = -1;
             }
         };
 
@@ -546,6 +681,10 @@ ModelVolumeType type_from_string(const std::string &s)
         IdToLayerConfigRangesMap m_layer_config_ranges;
         IdToSlaSupportPointsMap m_sla_support_points;
         IdToSlaDrainHolesMap    m_sla_drain_holes;
+        int m_current_color_group {-1};
+        std::map<int, std::vector<std::string>> m_group_id_to_colors;
+        std::map<std::string, int> m_color_to_extruder_id;
+        std::map<std::pair<int, int>, int> m_color_group_entry_to_extruder_id;
         std::string m_curr_metadata_name;
         std::string m_curr_characters;
         std::string m_name;
@@ -599,6 +738,12 @@ ModelVolumeType type_from_string(const std::string &s)
 
         bool _handle_start_object(const char** attributes, unsigned int num_attributes);
         bool _handle_end_object();
+
+        bool _handle_start_color_group(const char** attributes, unsigned int num_attributes);
+        bool _handle_end_color_group();
+
+        bool _handle_start_color(const char** attributes, unsigned int num_attributes);
+        bool _handle_end_color();
 
         bool _handle_start_mesh(const char** attributes, unsigned int num_attributes);
         bool _handle_end_mesh();
@@ -697,6 +842,10 @@ ModelVolumeType type_from_string(const std::string &s)
         m_layer_heights_profiles.clear();
         m_layer_config_ranges.clear();
         m_sla_support_points.clear();
+        m_current_color_group = -1;
+        m_group_id_to_colors.clear();
+        m_color_to_extruder_id.clear();
+        m_color_group_entry_to_extruder_id.clear();
         m_curr_metadata_name.clear();
         m_curr_characters.clear();
         clear_errors();
@@ -1439,6 +1588,10 @@ ModelVolumeType type_from_string(const std::string &s)
             res = _handle_start_model(attributes, num_attributes);
         else if (::strcmp(RESOURCES_TAG, name) == 0)
             res = _handle_start_resources(attributes, num_attributes);
+        else if (::strcmp(COLOR_GROUP_TAG, name) == 0)
+            res = _handle_start_color_group(attributes, num_attributes);
+        else if (::strcmp(COLOR_TAG, name) == 0)
+            res = _handle_start_color(attributes, num_attributes);
         else if (::strcmp(OBJECT_TAG, name) == 0)
             res = _handle_start_object(attributes, num_attributes);
         else if (::strcmp(MESH_TAG, name) == 0)
@@ -1477,6 +1630,10 @@ ModelVolumeType type_from_string(const std::string &s)
             res = _handle_end_model();
         else if (::strcmp(RESOURCES_TAG, name) == 0)
             res = _handle_end_resources();
+        else if (::strcmp(COLOR_GROUP_TAG, name) == 0)
+            res = _handle_end_color_group();
+        else if (::strcmp(COLOR_TAG, name) == 0)
+            res = _handle_end_color();
         else if (::strcmp(OBJECT_TAG, name) == 0)
             res = _handle_end_object();
         else if (::strcmp(MESH_TAG, name) == 0)
@@ -1622,6 +1779,8 @@ ModelVolumeType type_from_string(const std::string &s)
                 m_curr_object.object->name = m_name + "_" + std::to_string(m_model->objects.size());
 
             m_curr_object.id = get_attribute_value_int(attributes, num_attributes, ID_ATTR);
+            const char* pid_attr = get_attribute_value_charptr(attributes, num_attributes, PID_ATTR);
+            m_curr_object.pid = pid_attr != nullptr ? get_attribute_value_int(attributes, num_attributes, PID_ATTR) : -1;
         }
 
         return true;
@@ -1630,6 +1789,10 @@ ModelVolumeType type_from_string(const std::string &s)
     bool _3MF_Importer::_handle_end_object()
     {
         if (m_curr_object.object != nullptr) {
+            auto object_extruder = m_color_group_entry_to_extruder_id.find(std::make_pair(m_curr_object.pid, 0));
+            if (object_extruder != m_color_group_entry_to_extruder_id.end())
+                m_curr_object.object->config.set("extruder", object_extruder->second);
+
             if (m_curr_object.geometry.empty()) {
                 // no geometry defined
                 // remove the object from the model
@@ -1665,6 +1828,42 @@ ModelVolumeType type_from_string(const std::string &s)
             }
         }
 
+        return true;
+    }
+
+    bool _3MF_Importer::_handle_start_color_group(const char** attributes, unsigned int num_attributes)
+    {
+        m_current_color_group = get_attribute_value_int(attributes, num_attributes, ID_ATTR);
+        return true;
+    }
+
+    bool _3MF_Importer::_handle_end_color_group()
+    {
+        return true;
+    }
+
+    bool _3MF_Importer::_handle_start_color(const char** attributes, unsigned int num_attributes)
+    {
+        const std::string color = get_attribute_value_string(attributes, num_attributes, COLOR_ATTR);
+        if (m_current_color_group < 0 || color.empty())
+            return true;
+
+        std::vector<std::string>& colors = m_group_id_to_colors[m_current_color_group];
+        const int color_idx = int(colors.size());
+        colors.push_back(color);
+
+        auto color_it = m_color_to_extruder_id.find(color);
+        if (color_it == m_color_to_extruder_id.end()) {
+            const int extruder_id = int(m_color_to_extruder_id.size()) + 1;
+            color_it = m_color_to_extruder_id.insert({ color, extruder_id }).first;
+        }
+        m_color_group_entry_to_extruder_id[{ m_current_color_group, color_idx }] = color_it->second;
+
+        return true;
+    }
+
+    bool _3MF_Importer::_handle_end_color()
+    {
         return true;
     }
 
@@ -1715,6 +1914,10 @@ ModelVolumeType type_from_string(const std::string &s)
     {
         // reset current triangles
         m_curr_object.geometry.triangles.clear();
+        m_curr_object.geometry.triangle_pid.clear();
+        m_curr_object.geometry.triangle_p1.clear();
+        m_curr_object.geometry.triangle_p2.clear();
+        m_curr_object.geometry.triangle_p3.clear();
         return true;
     }
 
@@ -1740,10 +1943,30 @@ ModelVolumeType type_from_string(const std::string &s)
             get_attribute_value_int(attributes, num_attributes, V2_ATTR),
             get_attribute_value_int(attributes, num_attributes, V3_ATTR));
 
+        const char* pid_attr = get_attribute_value_charptr(attributes, num_attributes, PID_ATTR);
+        const int   pid      = pid_attr != nullptr ? get_attribute_value_int(attributes, num_attributes, PID_ATTR) : -1;
+        const int   p1       = pid_attr != nullptr ? (get_attribute_value_charptr(attributes, num_attributes, P1_ATTR) != nullptr ? get_attribute_value_int(attributes, num_attributes, P1_ATTR) : 0) : -1;
+        const int   p2       = pid_attr != nullptr ? (get_attribute_value_charptr(attributes, num_attributes, P2_ATTR) != nullptr ? get_attribute_value_int(attributes, num_attributes, P2_ATTR) : p1) : -1;
+        const int   p3       = pid_attr != nullptr ? (get_attribute_value_charptr(attributes, num_attributes, P3_ATTR) != nullptr ? get_attribute_value_int(attributes, num_attributes, P3_ATTR) : p1) : -1;
+
         m_curr_object.geometry.custom_supports.push_back(get_attribute_value_string(attributes, num_attributes, CUSTOM_SUPPORTS_ATTR));
         m_curr_object.geometry.custom_seam.push_back(get_attribute_value_string(attributes, num_attributes, CUSTOM_SEAM_ATTR));
         m_curr_object.geometry.fuzzy_skin.push_back(get_attribute_value_string(attributes, num_attributes, FUZZY_SKIN_ATTR));
-        m_curr_object.geometry.mmu_segmentation.push_back(get_attribute_value_string(attributes, num_attributes, MMU_SEGMENTATION_ATTR));
+
+        std::string mmu_segmentation = get_attribute_value_string(attributes, num_attributes, MMU_SEGMENTATION_ATTR);
+        if (mmu_segmentation.empty()) {
+            std::pair<int, int> color_ref;
+            if (resolve_uniform_triangle_color_ref(pid, p1, p2, p3, color_ref)) {
+                auto extruder_it = m_color_group_entry_to_extruder_id.find(color_ref);
+                if (extruder_it != m_color_group_entry_to_extruder_id.end())
+                    mmu_segmentation = encode_extruder_id_for_mmu_segmentation(extruder_it->second);
+            }
+        }
+        m_curr_object.geometry.mmu_segmentation.push_back(std::move(mmu_segmentation));
+        m_curr_object.geometry.triangle_pid.push_back(pid);
+        m_curr_object.geometry.triangle_p1.push_back(p1);
+        m_curr_object.geometry.triangle_p2.push_back(p2);
+        m_curr_object.geometry.triangle_p3.push_back(p3);
         return true;
     }
 
@@ -2166,12 +2389,42 @@ ModelVolumeType type_from_string(const std::string &s)
                 assert(index < geometry.custom_supports.size());
                 assert(index < geometry.custom_seam.size());
                 assert(index < geometry.mmu_segmentation.size());
+                assert(index < geometry.triangle_pid.size());
+                assert(index < geometry.triangle_p1.size());
+                assert(index < geometry.triangle_p2.size());
+                assert(index < geometry.triangle_p3.size());
                 if (! geometry.custom_supports[index].empty())
                     volume->supported_facets.set_triangle_from_string(i, geometry.custom_supports[index]);
                 if (! geometry.custom_seam[index].empty())
                     volume->seam_facets.set_triangle_from_string(i, geometry.custom_seam[index]);
                 if (! geometry.mmu_segmentation[index].empty())
                     volume->mmu_segmentation_facets.set_triangle_from_string(i, geometry.mmu_segmentation[index]);
+                else {
+                    const Vec3i32& tri = geometry.triangles[index];
+                    if (tri[0] >= 0 && tri[1] >= 0 && tri[2] >= 0 &&
+                        tri[0] < int(geometry.vertices.size()) &&
+                        tri[1] < int(geometry.vertices.size()) &&
+                        tri[2] < int(geometry.vertices.size())) {
+                        std::array<int, 3> corner_extruders;
+                        if (resolve_triangle_corner_extruders(
+                                geometry.triangle_pid[index],
+                                geometry.triangle_p1[index],
+                                geometry.triangle_p2[index],
+                                geometry.triangle_p3[index],
+                                m_color_group_entry_to_extruder_id,
+                                corner_extruders)) {
+                            std::string encoded;
+                            if (encode_triangle_corner_segmentation(
+                                    geometry.vertices[tri[0]],
+                                    geometry.vertices[tri[1]],
+                                    geometry.vertices[tri[2]],
+                                    corner_extruders,
+                                    encoded) && !encoded.empty()) {
+                                volume->mmu_segmentation_facets.set_triangle_from_string(i, encoded);
+                            }
+                        }
+                    }
+                }
                 if (! geometry.fuzzy_skin[index].empty())
                 	volume->fuzzy_skin_facets.set_triangle_from_string(i, geometry.fuzzy_skin[index]);
             }

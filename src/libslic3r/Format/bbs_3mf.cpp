@@ -18,6 +18,8 @@
 #include <limits>
 #include <stdexcept>
 #include <iomanip>
+#include <array>
+#include <cmath>
 
 #include <boost/assign.hpp>
 #include <boost/bimap.hpp>
@@ -268,6 +270,9 @@ static constexpr const char* Z_ATTR = "z";
 static constexpr const char* V1_ATTR = "v1";
 static constexpr const char* V2_ATTR = "v2";
 static constexpr const char* V3_ATTR = "v3";
+static constexpr const char* P1_ATTR = "p1";
+static constexpr const char* P2_ATTR = "p2";
+static constexpr const char* P3_ATTR = "p3";
 static constexpr const char* OBJECTID_ATTR = "objectid";
 static constexpr const char* TRANSFORM_ATTR = "transform";
 // BBS
@@ -459,6 +464,122 @@ bool bbs_get_attribute_value_bool(const char** attributes, unsigned int attribut
 {
     const char* text = bbs_get_attribute_value_charptr(attributes, attributes_size, attribute_key);
     return (text != nullptr) ? (bool)::atoi(text) : true;
+}
+
+std::string bbs_encode_extruder_id_for_mmu_segmentation(int extruder_id)
+{
+    static const std::array<const char*, 17> states = {
+        "", "4", "8", "0C", "1C", "2C", "3C", "4C", "5C", "6C", "7C", "8C", "9C", "AC", "BC", "CC", "DC"
+    };
+
+    if (extruder_id <= 0 || extruder_id >= int(states.size()))
+        return {};
+
+    return states[extruder_id];
+}
+
+bool bbs_resolve_uniform_triangle_color_ref(int pid, int p1, int p2, int p3, std::pair<int, int>& color_ref)
+{
+    if (pid < 0)
+        return false;
+
+    const int cp1 = (p1 < 0) ? 0 : p1;
+    const int cp2 = (p2 < 0) ? cp1 : p2;
+    const int cp3 = (p3 < 0) ? cp1 : p3;
+    if (cp1 != cp2 || cp1 != cp3)
+        return false;
+
+    color_ref = std::make_pair(pid, cp1);
+    return true;
+}
+
+bool bbs_resolve_triangle_corner_extruders(
+    int pid,
+    int p1,
+    int p2,
+    int p3,
+    const std::map<std::pair<int, int>, int>& color_entry_to_extruder,
+    std::array<int, 3>& out_extruders)
+{
+    if (pid < 0)
+        return false;
+
+    const int cp1 = (p1 < 0) ? 0 : p1;
+    const int cp2 = (p2 < 0) ? cp1 : p2;
+    const int cp3 = (p3 < 0) ? cp1 : p3;
+
+    const auto it1 = color_entry_to_extruder.find({ pid, cp1 });
+    const auto it2 = color_entry_to_extruder.find({ pid, cp2 });
+    const auto it3 = color_entry_to_extruder.find({ pid, cp3 });
+    if (it1 == color_entry_to_extruder.end() || it2 == color_entry_to_extruder.end() || it3 == color_entry_to_extruder.end())
+        return false;
+
+    out_extruders = { it1->second, it2->second, it3->second };
+    return true;
+}
+
+bool bbs_encode_triangle_corner_segmentation(
+    const Vec3f& v0,
+    const Vec3f& v1,
+    const Vec3f& v2,
+    const std::array<int, 3>& extruders,
+    std::string& out)
+{
+    out.clear();
+
+    const int e0 = extruders[0];
+    const int e1 = extruders[1];
+    const int e2 = extruders[2];
+    const std::string s0 = bbs_encode_extruder_id_for_mmu_segmentation(e0);
+    const std::string s1 = bbs_encode_extruder_id_for_mmu_segmentation(e1);
+    const std::string s2 = bbs_encode_extruder_id_for_mmu_segmentation(e2);
+    if (s0.empty() || s1.empty() || s2.empty())
+        return false;
+
+    if (e0 == e1 && e1 == e2) {
+        out = s0;
+        return true;
+    }
+
+    if (e0 == e1) {
+        out = s2 + s0 + s0 + "A";
+        return true;
+    }
+    if (e1 == e2) {
+        out = s0 + s1 + s1 + "2";
+        return true;
+    }
+    if (e0 == e2) {
+        out = s1 + s0 + s0 + "6";
+        return true;
+    }
+
+    auto angle_at = [](const Vec3f& a, const Vec3f& b) {
+        const float denom = a.norm() * b.norm();
+        if (denom <= 1e-8f)
+            return 0.0f;
+        const float cosine = std::max(-1.0f, std::min(1.0f, a.dot(b) / denom));
+        return std::acos(cosine);
+    };
+
+    const float angle0 = angle_at(v1 - v0, v2 - v0);
+    const float angle1 = angle_at(v0 - v1, v2 - v1);
+    const float angle2 = angle_at(v0 - v2, v1 - v2);
+
+    int max_angle_vertex = 0;
+    if (angle1 > angle0 && angle1 >= angle2)
+        max_angle_vertex = 1;
+    else if (angle2 > angle0 && angle2 > angle1)
+        max_angle_vertex = 2;
+
+    if (max_angle_vertex == 0)
+        out = s0 + s1 + s2 + (s1 + s2 + "5") + "3";
+    else if (max_angle_vertex == 1)
+        out = s0 + s1 + s2 + (s0 + s2 + "9") + "3";
+    else
+        out = s0 + s1 + s2 + (s1 + s0 + "1") + "3";
+
+    return true;
 }
 
 void add_vec3(std::stringstream &stream, const Slic3r::Vec3f &tr)
@@ -709,6 +830,10 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
             std::vector<std::string> custom_seam;
             std::vector<std::string> mmu_segmentation;
             std::vector<std::string> fuzzy_skin;
+            std::vector<int> triangle_pid;
+            std::vector<int> triangle_p1;
+            std::vector<int> triangle_p2;
+            std::vector<int> triangle_p3;
             // BBS
             std::vector<std::string> face_properties;
 
@@ -720,6 +845,12 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
                 std::swap(triangles, o.triangles);
                 std::swap(custom_supports, o.custom_supports);
                 std::swap(custom_seam, o.custom_seam);
+                std::swap(mmu_segmentation, o.mmu_segmentation);
+                std::swap(fuzzy_skin, o.fuzzy_skin);
+                std::swap(triangle_pid, o.triangle_pid);
+                std::swap(triangle_p1, o.triangle_p1);
+                std::swap(triangle_p2, o.triangle_p2);
+                std::swap(triangle_p3, o.triangle_p3);
             }
 
             void reset() {
@@ -729,6 +860,10 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
                 custom_seam.clear();
                 mmu_segmentation.clear();
                 fuzzy_skin.clear();
+                triangle_pid.clear();
+                triangle_p1.clear();
+                triangle_p2.clear();
+                triangle_p3.clear();
             }
         };
 
@@ -884,7 +1019,7 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
             std::string obj_curr_characters;
             float object_unit_factor;
             int object_current_color_group{-1};
-            std::map<int, std::string> object_group_id_to_color;
+            std::map<int, std::vector<std::string>> object_group_id_to_color;
             bool is_bbl_3mf { false };
 
             ObjectImporter(_BBS_3MF_Importer *importer, std::string file_path, std::string obj_path)
@@ -1082,7 +1217,9 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
         CurrentInstance m_curr_instance;
 
         int m_current_color_group{-1};
-        std::map<int, std::string> m_group_id_to_color;
+        std::map<int, std::vector<std::string>> m_group_id_to_color;
+        std::map<std::pair<int, int>, int> m_color_group_entry_to_extruder_id;
+        std::map<int, int> m_color_group_to_default_extruder_id;
 
     public:
         _BBS_3MF_Importer();
@@ -1326,6 +1463,10 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
         m_layer_heights_profiles.clear();
         m_layer_config_ranges.clear();
         m_brim_ear_points.clear();
+        m_group_id_to_color.clear();
+        m_color_group_entry_to_extruder_id.clear();
+        m_color_group_to_default_extruder_id.clear();
+        m_current_color_group = -1;
         //m_sla_support_points.clear();
         m_curr_metadata_name.clear();
         m_curr_characters.clear();
@@ -1724,8 +1865,10 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
             for (auto obj_importer : m_object_importers) {
                 for (const IdToCurrentObjectMap::value_type&  obj : obj_importer->object_list)
                     m_current_objects.insert({ std::move(obj.first), std::move(obj.second)});
-                for (auto group_color : obj_importer->object_group_id_to_color)
-                    m_group_id_to_color.insert(std::move(group_color));
+                for (const auto& group_color : obj_importer->object_group_id_to_color) {
+                    auto& dst = m_group_id_to_color[group_color.first];
+                    dst.insert(dst.end(), group_color.second.begin(), group_color.second.end());
+                }
 
                 delete obj_importer;
             }
@@ -1949,17 +2092,27 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
         }
 
         BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << ":" << __LINE__ << boost::format(", process group colors, size %1%\n")%m_group_id_to_color.size();
-        std::map<int, int> color_group_id_to_extruder_id_map;
+        m_color_group_entry_to_extruder_id.clear();
+        m_color_group_to_default_extruder_id.clear();
         std::map<std::string, int> color_to_extruder_id_map;
         int extruder_id = 0;
-        for (auto group_iter = m_group_id_to_color.begin(); group_iter != m_group_id_to_color.end(); ++group_iter) {
-            auto color_iter = color_to_extruder_id_map.find(group_iter->second);
-            if (color_iter == color_to_extruder_id_map.end()) {
-                ++extruder_id;
-                color_to_extruder_id_map[group_iter->second] = extruder_id;
-                color_group_id_to_extruder_id_map[group_iter->first] = extruder_id;
-            } else {
-                color_group_id_to_extruder_id_map[group_iter->first] = color_iter->second;
+        for (const auto& group_iter : m_group_id_to_color) {
+            const int group_id = group_iter.first;
+            for (size_t color_idx = 0; color_idx < group_iter.second.size(); ++color_idx) {
+                const std::string& color = group_iter.second[color_idx];
+                if (color.empty())
+                    continue;
+
+                auto color_iter = color_to_extruder_id_map.find(color);
+                if (color_iter == color_to_extruder_id_map.end()) {
+                    ++extruder_id;
+                    color_iter = color_to_extruder_id_map.insert({ color, extruder_id }).first;
+                }
+
+                const int mapped_extruder = color_iter->second;
+                m_color_group_entry_to_extruder_id[{ group_id, int(color_idx) }] = mapped_extruder;
+                if (color_idx == 0)
+                    m_color_group_to_default_extruder_id[group_id] = mapped_extruder;
             }
         }
 
@@ -2062,8 +2215,8 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
                         model_object->name = "Object_"+std::to_string(object.second+1);
 
                     // get color
-                    auto extruder_itor = color_group_id_to_extruder_id_map.find(current_object->second.pid);
-                    if (extruder_itor != color_group_id_to_extruder_id_map.end()) {
+                    auto extruder_itor = m_color_group_to_default_extruder_id.find(current_object->second.pid);
+                    if (extruder_itor != m_color_group_to_default_extruder_id.end()) {
                         model_object->config.set_key_value("extruder", new ConfigOptionInt(extruder_itor->second));
                     }
                 }
@@ -3560,7 +3713,8 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
     bool _BBS_3MF_Importer::_handle_start_color(const char **attributes, unsigned int num_attributes)
     {
         std::string color = bbs_get_attribute_value_string(attributes, num_attributes, COLOR_ATTR);
-        m_group_id_to_color[m_current_color_group] = color;
+        if (m_current_color_group >= 0 && !color.empty())
+            m_group_id_to_color[m_current_color_group].push_back(color);
         return true;
     }
 
@@ -3619,8 +3773,13 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
     bool _BBS_3MF_Importer::_handle_start_triangles(const char** attributes, unsigned int num_attributes)
     {
         // reset current triangles
-        if (m_curr_object)
+        if (m_curr_object) {
             m_curr_object->geometry.triangles.clear();
+            m_curr_object->geometry.triangle_pid.clear();
+            m_curr_object->geometry.triangle_p1.clear();
+            m_curr_object->geometry.triangle_p2.clear();
+            m_curr_object->geometry.triangle_p3.clear();
+        }
         return true;
     }
 
@@ -3647,10 +3806,20 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
                 bbs_get_attribute_value_int(attributes, num_attributes, V2_ATTR),
                 bbs_get_attribute_value_int(attributes, num_attributes, V3_ATTR));
 
+            const char* pid_attr = bbs_get_attribute_value_charptr(attributes, num_attributes, PID_ATTR);
+            const int   pid      = pid_attr != nullptr ? bbs_get_attribute_value_int(attributes, num_attributes, PID_ATTR) : -1;
+            const int   p1       = pid_attr != nullptr ? (bbs_get_attribute_value_charptr(attributes, num_attributes, P1_ATTR) != nullptr ? bbs_get_attribute_value_int(attributes, num_attributes, P1_ATTR) : 0) : -1;
+            const int   p2       = pid_attr != nullptr ? (bbs_get_attribute_value_charptr(attributes, num_attributes, P2_ATTR) != nullptr ? bbs_get_attribute_value_int(attributes, num_attributes, P2_ATTR) : p1) : -1;
+            const int   p3       = pid_attr != nullptr ? (bbs_get_attribute_value_charptr(attributes, num_attributes, P3_ATTR) != nullptr ? bbs_get_attribute_value_int(attributes, num_attributes, P3_ATTR) : p1) : -1;
+
             m_curr_object->geometry.custom_supports.push_back(bbs_get_attribute_value_string(attributes, num_attributes, CUSTOM_SUPPORTS_ATTR));
             m_curr_object->geometry.custom_seam.push_back(bbs_get_attribute_value_string(attributes, num_attributes, CUSTOM_SEAM_ATTR));
             m_curr_object->geometry.mmu_segmentation.push_back(bbs_get_attribute_value_string(attributes, num_attributes, MMU_SEGMENTATION_ATTR));
             m_curr_object->geometry.fuzzy_skin.push_back(bbs_get_attribute_value_string(attributes, num_attributes, CUSTOM_FUZZY_SKIN_ATTR));
+            m_curr_object->geometry.triangle_pid.push_back(pid);
+            m_curr_object->geometry.triangle_p1.push_back(p1);
+            m_curr_object->geometry.triangle_p2.push_back(p2);
+            m_curr_object->geometry.triangle_p3.push_back(p3);
             // BBS
             m_curr_object->geometry.face_properties.push_back(bbs_get_attribute_value_string(attributes, num_attributes, FACE_PROPERTY_ATTR));
         }
@@ -4819,12 +4988,42 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
                     assert(i < sub_object->geometry.custom_seam.size());
                     assert(i < sub_object->geometry.mmu_segmentation.size());
                     assert(i < sub_object->geometry.fuzzy_skin.size());
+                    assert(i < sub_object->geometry.triangle_pid.size());
+                    assert(i < sub_object->geometry.triangle_p1.size());
+                    assert(i < sub_object->geometry.triangle_p2.size());
+                    assert(i < sub_object->geometry.triangle_p3.size());
                     if (! sub_object->geometry.custom_supports[i].empty())
                         volume->supported_facets.set_triangle_from_string(i, sub_object->geometry.custom_supports[i]);
                     if (! sub_object->geometry.custom_seam[i].empty())
                         volume->seam_facets.set_triangle_from_string(i, sub_object->geometry.custom_seam[i]);
                     if (! sub_object->geometry.mmu_segmentation[i].empty())
                         volume->mmu_segmentation_facets.set_triangle_from_string(i, sub_object->geometry.mmu_segmentation[i]);
+                    else {
+                        const Vec3i32& tri = sub_object->geometry.triangles[i];
+                        if (tri[0] >= 0 && tri[1] >= 0 && tri[2] >= 0 &&
+                            tri[0] < int(sub_object->geometry.vertices.size()) &&
+                            tri[1] < int(sub_object->geometry.vertices.size()) &&
+                            tri[2] < int(sub_object->geometry.vertices.size())) {
+                            std::array<int, 3> corner_extruders;
+                            if (bbs_resolve_triangle_corner_extruders(
+                                    sub_object->geometry.triangle_pid[i],
+                                    sub_object->geometry.triangle_p1[i],
+                                    sub_object->geometry.triangle_p2[i],
+                                    sub_object->geometry.triangle_p3[i],
+                                    m_color_group_entry_to_extruder_id,
+                                    corner_extruders)) {
+                                std::string encoded;
+                                if (bbs_encode_triangle_corner_segmentation(
+                                        sub_object->geometry.vertices[tri[0]],
+                                        sub_object->geometry.vertices[tri[1]],
+                                        sub_object->geometry.vertices[tri[2]],
+                                        corner_extruders,
+                                        encoded) && !encoded.empty()) {
+                                    volume->mmu_segmentation_facets.set_triangle_from_string(i, encoded);
+                                }
+                            }
+                        }
+                    }
                     if (!sub_object->geometry.fuzzy_skin[i].empty())
                         volume->fuzzy_skin_facets.set_triangle_from_string(i, sub_object->geometry.fuzzy_skin[i]);
                 }
@@ -5202,7 +5401,8 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
     bool _BBS_3MF_Importer::ObjectImporter::_handle_object_start_color(const char **attributes, unsigned int num_attributes)
     {
         std::string color = bbs_get_attribute_value_string(attributes, num_attributes, COLOR_ATTR);
-        object_group_id_to_color[object_current_color_group] = color;
+        if (object_current_color_group >= 0 && !color.empty())
+            object_group_id_to_color[object_current_color_group].push_back(color);
         return true;
     }
 
@@ -5261,8 +5461,13 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
     bool _BBS_3MF_Importer::ObjectImporter::_handle_object_start_triangles(const char** attributes, unsigned int num_attributes)
     {
         // reset current triangles
-        if (current_object)
+        if (current_object) {
             current_object->geometry.triangles.clear();
+            current_object->geometry.triangle_pid.clear();
+            current_object->geometry.triangle_p1.clear();
+            current_object->geometry.triangle_p2.clear();
+            current_object->geometry.triangle_p3.clear();
+        }
         return true;
     }
 
@@ -5289,10 +5494,20 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
                 bbs_get_attribute_value_int(attributes, num_attributes, V2_ATTR),
                 bbs_get_attribute_value_int(attributes, num_attributes, V3_ATTR));
 
+            const char* pid_attr = bbs_get_attribute_value_charptr(attributes, num_attributes, PID_ATTR);
+            const int   pid      = pid_attr != nullptr ? bbs_get_attribute_value_int(attributes, num_attributes, PID_ATTR) : -1;
+            const int   p1       = pid_attr != nullptr ? (bbs_get_attribute_value_charptr(attributes, num_attributes, P1_ATTR) != nullptr ? bbs_get_attribute_value_int(attributes, num_attributes, P1_ATTR) : 0) : -1;
+            const int   p2       = pid_attr != nullptr ? (bbs_get_attribute_value_charptr(attributes, num_attributes, P2_ATTR) != nullptr ? bbs_get_attribute_value_int(attributes, num_attributes, P2_ATTR) : p1) : -1;
+            const int   p3       = pid_attr != nullptr ? (bbs_get_attribute_value_charptr(attributes, num_attributes, P3_ATTR) != nullptr ? bbs_get_attribute_value_int(attributes, num_attributes, P3_ATTR) : p1) : -1;
+
             current_object->geometry.custom_supports.push_back(bbs_get_attribute_value_string(attributes, num_attributes, CUSTOM_SUPPORTS_ATTR));
             current_object->geometry.custom_seam.push_back(bbs_get_attribute_value_string(attributes, num_attributes, CUSTOM_SEAM_ATTR));
             current_object->geometry.mmu_segmentation.push_back(bbs_get_attribute_value_string(attributes, num_attributes, MMU_SEGMENTATION_ATTR));
             current_object->geometry.fuzzy_skin.push_back(bbs_get_attribute_value_string(attributes, num_attributes, CUSTOM_FUZZY_SKIN_ATTR));
+            current_object->geometry.triangle_pid.push_back(pid);
+            current_object->geometry.triangle_p1.push_back(p1);
+            current_object->geometry.triangle_p2.push_back(p2);
+            current_object->geometry.triangle_p3.push_back(p3);
             // BBS
             current_object->geometry.face_properties.push_back(bbs_get_attribute_value_string(attributes, num_attributes, FACE_PROPERTY_ATTR));
         }
